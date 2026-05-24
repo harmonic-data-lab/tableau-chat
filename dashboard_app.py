@@ -12,8 +12,8 @@ from mcp.client.stdio import stdio_client
 # LangChain Libraries
 from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_openai import ChatOpenAI
-from langgraph.prebuilt import create_react_agent
-from langchain_core.messages import HumanMessage
+from langgraph.prebuilt import create_react_agent, ToolNode
+from langchain_core.messages import HumanMessage, trim_messages
 from langgraph.checkpoint.memory import InMemorySaver
 
 # Set Local MCP Logging
@@ -21,26 +21,32 @@ from utilities.logging_config import setup_logging
 logger = setup_logging("dashboard_app.log")
 
 # Load System Prompt and Message Formatter
-from utilities.prompt import SUPERSTORE_AGENT_SYSTEM_PROMPT
+from utilities.prompt import AGENT_SYSTEM_PROMPT as SUPERSTORE_AGENT_SYSTEM_PROMPT
 from utilities.chat import format_agent_response
 
 # Load Environment and set MCP Filepath
 import os
+import uuid
 from dotenv import load_dotenv
 load_dotenv()
+
+# Single thread ID for the lifetime of this server process — gives multi-turn
+# memory within a session while guaranteeing a clean slate on restart
+SESSION_THREAD_ID = str(uuid.uuid4())
 
 ### Override existing MCP Location and Toolset to import custom tools from:
 # https://github.com/wjsutton/tableau-mcp-experimental for dashboard extension
 # Remember to execute 'npm install' & 'npm run build' in the tableau-mcp-experimental folder
 # These tools are fixed to 1 datasource via the FIXED_DATASOURCE_LUID environment variable in your .env file
-mcp_location = 'your/local/filepath/to/tableau-mcp-experimental/build/index.js'
-tool_list = 'list-fields-fixed, read-metadata-fixed, query-datasource-fixed'
+mcp_location = '/Users/austinkness/Tableau MCP/tableau-mcp-experimental/build/index.js'
+tool_list = 'list-fields-fixed, query-datasource-fixed'
 datasource_luid = os.environ.get('FIXED_DATASOURCE_LUID')
 
 custom_env = {
     **os.environ,
     "INCLUDE_TOOLS": tool_list,
     "FIXED_DATASOURCE_LUID": datasource_luid,
+    "MAX_RESULT_LIMIT": "100",  # cap rows returned to keep context small
 }
 
 # Set Langfuse Tracing
@@ -74,12 +80,25 @@ async def lifespan(app: FastAPI):
                 # Get tools, filter tools using the .env config
                 mcp_tools = await load_mcp_tools(client_session)
                 
-                # Set AI Model
-                llm = ChatOpenAI(model="gpt-4.1", temperature=0)
+                # Set AI Model — max_retries=0 so rate limit errors fail fast
+                # rather than waiting minutes for OpenAI's internal backoff
+                llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, max_retries=0)
 
-                # Create the agent
+                # Trim history to last 10 messages before each LLM call so old
+                # tool results don't contaminate new queries or bloat the context
+                def trim_history(state):
+                    return {"messages": trim_messages(
+                        state["messages"],
+                        max_tokens=10,
+                        token_counter=len,
+                        strategy="last",
+                        include_system=True,
+                        allow_partial=False,
+                    )}
+
                 checkpointer = InMemorySaver()
-                agent = create_react_agent(model=llm, tools=mcp_tools, prompt=SUPERSTORE_AGENT_SYSTEM_PROMPT, checkpointer=checkpointer)
+                tool_node = ToolNode(mcp_tools, handle_tool_errors=True)
+                agent = create_react_agent(model=llm, tools=tool_node, prompt=SUPERSTORE_AGENT_SYSTEM_PROMPT, checkpointer=checkpointer, pre_model_hook=trim_history)
                 
                 yield
         
@@ -130,7 +149,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
         messages = [HumanMessage(content=request.message)]
 
         # Get response from agent
-        response_text = await format_agent_response(agent, messages, langfuse_handler)
+        response_text = await format_agent_response(agent, messages, langfuse_handler, SESSION_THREAD_ID)
         
         return ChatResponse(response=response_text)
         

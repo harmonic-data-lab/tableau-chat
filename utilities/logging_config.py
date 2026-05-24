@@ -15,9 +15,9 @@ def setup_logging(filename="app.log"):
         ]
     )
     
-    # Suppress MCP warnings
+    # Suppress noisy third-party loggers
     logging.getLogger('mcp').setLevel(logging.ERROR)
-    logging.getLogger('root').setLevel(logging.ERROR)
-    
-    # Return logger for the calling module
-    return logging.getLogger(__name__)
+    logging.getLogger('httpx').setLevel(logging.ERROR)
+    logging.getLogger('openai').setLevel(logging.ERROR)
+
+    return logging.getLogger('dashboard')
